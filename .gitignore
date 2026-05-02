@@ -12,3 +12,4 @@ model/*
 data/*
 .DS_Store
 .venv-notebook/
+src/data/
