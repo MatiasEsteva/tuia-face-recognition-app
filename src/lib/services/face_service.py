@@ -12,6 +12,8 @@ from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFa
 from lib.storage.base import EmbeddingStoreProtocol
 import os 
 import logging
+from facenet_pytorch import MTCNN
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +32,25 @@ class FaceService:
         self.similarity_metric = similarity_metric
         self.similarity_threshold = similarity_threshold
         self.face_size = face_size
-        self.model: any = self._load_model(model_path)
         self.output_path = output_path
 
+
+        self._fa = MTCNN(
+            image_size=face_size,
+            keep_all=True,
+            min_face_size=20,
+            thresholds=[0.6, 0.7, 0.7],
+            margin=20,
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),)
+        
+
+        self.model = self._load_model(model_path)
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self._device)
+        self.model.eval()
+
         os.makedirs(self.output_path, exist_ok=True)
+        logger.info(f"FaceService inicializado | dispositivo: {self._device}")
 
     @staticmethod
     def _clip_xyxy(
@@ -79,28 +96,99 @@ class FaceService:
 
     def detect_faces(self, image: np.ndarray) -> list[tuple[int, int, int, int]]:
         """
-        Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
-        Return a list of tuples with the coordinates of the faces detected in the image.
+        Detecta todas las caras presentes en una imagen  usando MTCNN.
+        Recibe imagen BGR, devuelve lista de (x1, y1, x2, y2).
         """
-        raise NotImplementedError("Not implemented")
+
+        img_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)) # Convierte la imagen de BGR (OpenCV) a RGB (PIL)  MTCNN 
+        boxes, probs = self._fa.detect(img_pil, landmarks=False) # detecta cara y devuelve los 4 puntos y probs
+
+        if boxes is None:
+            return []
+
+        resultado = []
+        for box, prob in zip(boxes, probs):
+            if prob < 0.9:          # filtra detecciones con probabilidad baja
+                continue
+            x1, y1, x2, y2 = self._clip_xyxy(
+                int(box[0]), int(box[1]), int(box[2]), int(box[3]),
+                image.shape[0], image.shape[1]
+            )                                            #Ajusta las coordenadas con _clip_xyxy para que no salgan fuera de la imagen
+            resultado.append((x1, y1, x2, y2))
+
+        return resultado
 
 
     def align_face(
-        self, image: np.ndarray, box: tuple[int, int, int, int]
-    ) -> AlignedFace:
+        self, image: np.ndarray, box: tuple[int, int, int, int]) -> AlignedFace:
         """
-        Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
-        Return an AlignedFace object.
+        Alinea la cara más cercana al box dado usando MTCNN.
+        Recibe imagen BGR, devuelve AlignedFace con imagen BGR normalizada.
         """
-        raise NotImplementedError("Not implemented")
+        img_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))  # Convierte la imagen de BGR (OpenCV) a RGB (PIL)
+        boxes, probs, landmarks = self._fa.detect(img_pil, landmarks=True) # 5 landmarks
+        faces_tensor = self._fa(img_pil)   # (N, 3, face_size, face_size) en [-1, 1]
+
+        x1, y1, x2, y2 = box
+
+        # Si hay más de una cara, buscar la más cercana al box dado
+        best_idx = 0
+        if boxes is not None and len(boxes) > 1:
+            min_dist = float("inf")
+            for i, b in enumerate(boxes):
+                dist = abs(int(b[0]) - x1) + abs(int(b[1]) - y1)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_idx = i
+
+        kps = landmarks[best_idx] if landmarks is not None else None
+
+        # Si MTCNN no pudo generar el tensor alineado hacer recorte simple
+        if faces_tensor is None:
+            x1c, y1c, x2c, y2c = self._clip_xyxy(
+               x1, y1, x2, y2, image.shape[0], image.shape[1]
+            )
+            crop = cv2.resize(
+                image[y1c:y2c, x1c:x2c],
+                (self.face_size, self.face_size)
+            )
+            if kps is not None:
+                kps = np.array([[pt[0] - x1, pt[1] - y1] for pt in kps]) #Convertir landmarks de coordenadas absolutas a relativas al crop
+            bbox = np.array(boxes[best_idx]) if boxes is not None else np.array(box)
+            return AlignedFace(bbox=bbox, keypoints=kps, image=face_bgr, embedding=None)
+
+        # Convertir tensor [-1,1] → BGR uint8
+        t = faces_tensor[best_idx] if faces_tensor.ndim == 4 else faces_tensor
+        face_np = ((t.permute(1, 2, 0).numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
+
+        face_bgr = cv2.cvtColor(face_np, cv2.COLOR_RGB2BGR) # Convertir RGB → BGR para mantener la convención de OpenCV en el resto del sistema
+
+        bbox = np.array(boxes[best_idx]) if boxes is not None else np.array(box)
+        if kps is not None:
+            kps = np.array([[pt[0] - x1, pt[1] - y1] for pt in kps]) #Convertir landmarks de coordenadas absolutas a relativas al crop
+
+        bbox = np.array(boxes[best_idx]) if boxes is not None else np.array(box)
+        return AlignedFace(bbox=bbox, keypoints=kps, image=face_bgr, embedding=None)
+
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
-        Extract embedding from face.
-        Return a list of floats representing the embedding of the face.
+        Extrae embedding de 512 dimensiones usando InceptionResnetV1.
+        Recibe AlignedFace con imagen BGR uint8, devuelve lista de 512 floats.
         """
-        raise NotImplementedError("Not implemented")
         
+        face_rgb = cv2.cvtColor(face.image, cv2.COLOR_BGR2RGB) # Convertir BGR uint8 → tensor RGB normalizado [-1, 1]
+        tensor = torch.tensor(face_rgb, dtype=torch.float32).permute(2, 0, 1)
+        tensor = (tensor - 127.5) / 128.0  # normalización estándar de FaceNet
+        tensor = tensor.unsqueeze(0).to(self._device)
+
+        with torch.no_grad():
+            embedding = self.model(tensor)
+
+        emb = embedding.squeeze().cpu().numpy()
+        emb = emb / (np.linalg.norm(emb) + 1e-8)
+        return emb.tolist()
+
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = np.linalg.norm(a) * np.linalg.norm(b)
         if denom == 0:
