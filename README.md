@@ -47,6 +47,46 @@ tp1/
 
 # Preparando el ambiente local
 
+
+## Notebook de experimentacion y analisis
+
+El repositorio incluye un notebook `.ipynb` utilizado para:
+
+- exploracion y analisis de datasets
+- visualizacion de embeddings
+- pruebas de reconocimiento facial
+- evaluacion y metricas
+- experimentacion con modelos y fine-tuning
+- generado y guardado de un modelo final
+- poblar base de datos con embeddings
+
+El notebook utiliza un entorno virtual separado.
+
+### Configuracion del entorno para notebook
+
+Crear y activar un entorno virtual independiente:
+
+```bash
+uv venv --python 3.12 .venv-notebook
+source .venv-notebook/bin/activate
+```
+
+Instalar dependencias:
+
+```bash
+uv pip install -r requirements-notebook.txt
+```
+
+### Dependencias CUDA
+
+Para aceleracion por GPU instalar PyTorch compatible con la version de CUDA disponible en el sistema.
+
+Ejemplo para CUDA 12.1:
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
 ## Requisitios para trabajar de forma local
 
 - Python 3.12
